@@ -1,5 +1,6 @@
 # TON New Token Tracker
 
+[![CI](https://github.com/exd77/ton-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/exd77/ton-tracker/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
 [![TON](https://img.shields.io/badge/TON-Blockchain-0098EA?logo=ton&logoColor=white)](https://ton.org/)
@@ -268,6 +269,14 @@ python -m py_compile tracker.py
 TELEGRAM_BOT_TOKEN='999999:TEST' TELEGRAM_CHAT_ID='0' python tracker.py --dry-run
 ```
 
+## Tests
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+CI runs `py_compile` + `pytest` on Python 3.11/3.12 for every push/PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## License
 
