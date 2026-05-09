@@ -1,4 +1,4 @@
-# TON NEW LAUNCH TOKEN TRACKER
+# $TON NEW LAUNCH TOKEN TRACKER
 
 [![CI](https://github.com/exd77/ton-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/exd77/ton-tracker/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
