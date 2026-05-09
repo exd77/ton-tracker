@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Runtime config and state
+.env
+.env.*
+!.env.example
+state/
+logs/
+*.log
+*.pid
+
+# Secrets / keys
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.local
+*.local.sh
+
+# IDE / local agents
+.vscode/
+.idea/
+.devin/
+.hermes/
+.openclaw/
+.awp-wallet/
+.openclaw-wallet/
+
+# OS / build
+.DS_Store
+build/
+dist/
+*.egg-info/

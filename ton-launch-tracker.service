@@ -1,0 +1,15 @@
+[Unit]
+Description=TON DeDust New Launch Telegram Tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ton-launch-tracker
+EnvironmentFile=/root/ton-launch-tracker/.env
+ExecStart=/root/ton-launch-tracker/.venv/bin/python /root/ton-launch-tracker/tracker.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
