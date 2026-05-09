@@ -42,11 +42,24 @@ class Config:
     x1000_base_url: str = "https://x1000.finance"
     x1000_token_route_pattern: str = ""
     x1000_cookie: str = ""
+    # STON.fi (second-largest TON DEX). Pool source is opt-in; same dedup
+    # state is shared with DeDust because pool addresses don't collide.
+    stonfi_enabled: bool = True
+    stonfi_pools_url: str = "https://api.ston.fi/v1/pools"
     progress_bar_length: int = 10
     description_max_chars: int = 300
     max_social_links: int = 5
     # Min TON liquidity filter for pool to qualify as a launch (0 = disabled).
     min_ton_reserves: Decimal = Decimal(0)
+    # Bonded curve % at which a memepad token is treated as graduated and
+    # gets its own alert. Cap of 100 enforced inside the helper.
+    graduation_threshold_pct: Decimal = Decimal("99")
+    # Decorate the Deployer block with a serial-farmer warning when the
+    # author has launched >= this many tokens in the cached x1000 list.
+    dev_cluster_warn_threshold: int = 3
+    # Render Telegram inline-keyboard buttons for chart / pool / explorer
+    # links instead of inline HTML <a> links inside the message body.
+    inline_buttons: bool = True
     # In-memory cache TTLs (seconds). Jetton metadata is quasi-static;
     # balance changes often but intra-tick reuse is still worthwhile;
     # x1000 list is shared across all pools in a tick.
@@ -81,10 +94,15 @@ class Config:
             x1000_base_url=os.getenv("X1000_BASE_URL", "https://x1000.finance").rstrip("/"),
             x1000_token_route_pattern=os.getenv("X1000_TOKEN_ROUTE_PATTERN", "").strip(),
             x1000_cookie=os.getenv("X1000_COOKIE", "").strip(),
+            stonfi_enabled=os.getenv("STONFI_ENABLED", "true").lower() == "true",
+            stonfi_pools_url=os.getenv("STONFI_POOLS_URL", "https://api.ston.fi/v1/pools"),
             progress_bar_length=int(os.getenv("PROGRESS_BAR_LENGTH", "10")),
             description_max_chars=int(os.getenv("DESCRIPTION_MAX_CHARS", "300")),
             max_social_links=int(os.getenv("MAX_SOCIAL_LINKS", "5")),
             min_ton_reserves=_safe_decimal(os.getenv("MIN_TON_RESERVES", "0")),
+            graduation_threshold_pct=_safe_decimal(os.getenv("GRADUATION_THRESHOLD_PCT", "99")),
+            dev_cluster_warn_threshold=int(os.getenv("DEV_CLUSTER_WARN_THRESHOLD", "3")),
+            inline_buttons=os.getenv("INLINE_BUTTONS", "true").lower() == "true",
             tonapi_cache_ttl=int(os.getenv("TONAPI_CACHE_TTL_SECONDS", "3600")),
             balance_cache_ttl=int(os.getenv("BALANCE_CACHE_TTL_SECONDS", "60")),
             x1000_cache_ttl=int(os.getenv("X1000_CACHE_TTL_SECONDS", "30")),
@@ -187,6 +205,10 @@ class State:
     def __init__(self, path: Path):
         self.path = path
         self.seen: set[str] = set()
+        # Memepad assets we've already alerted as graduated. Stored alongside
+        # `seen_pool_addresses` for backwards compatibility — old state files
+        # without this key keep working.
+        self.graduated: set[str] = set()
         self.last_checked_at: Optional[str] = None
         self.load()
 
@@ -195,12 +217,14 @@ class State:
             return
         data = json.loads(self.path.read_text())
         self.seen = set(data.get("seen_pool_addresses", []))
+        self.graduated = set(data.get("graduated_assets", []))
         self.last_checked_at = data.get("last_checked_at")
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "seen_pool_addresses": sorted(self.seen),
+            "graduated_assets": sorted(self.graduated),
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
         }
         self.path.write_text(json.dumps(data, indent=2))
@@ -572,6 +596,77 @@ def coin_tx_24h(coin: Optional[dict[str, Any]]) -> Optional[str]:
     return f"{b} buy / {s} sell"
 
 
+def format_tax(coin: Optional[dict[str, Any]]) -> Optional[str]:
+    """Render `buy_tax`/`sell_tax` (percent ints) with a severity icon.
+
+    None when both fields are missing — caller omits the line entirely.
+    """
+    if not coin:
+        return None
+    bt = coin.get("buy_tax")
+    st = coin.get("sell_tax")
+    if bt is None and st is None:
+        return None
+    try:
+        b = int(bt or 0)
+        s = int(st or 0)
+    except (ValueError, TypeError):
+        return None
+    worst = max(b, s)
+    if worst >= 25:
+        icon = " 🚨"
+    elif worst >= 10:
+        icon = " ⚠️"
+    elif worst > 0:
+        icon = ""
+    else:
+        icon = " ✅"
+    return f"{b}% / {s}%{icon}"
+
+
+_VERIFICATION_LABELS = {
+    0: ("Unverified", "❓"),
+    1: ("Indexed", "📋"),
+    2: ("Verified", "✅"),
+    3: ("Whitelisted", "🛡️"),
+}
+
+
+def format_verification(coin: Optional[dict[str, Any]]) -> Optional[str]:
+    if not coin:
+        return None
+    level = coin.get("verification_level")
+    if level is None:
+        return None
+    try:
+        n = int(level)
+    except (ValueError, TypeError):
+        return None
+    label, icon = _VERIFICATION_LABELS.get(n, (f"Level {n}", "❓"))
+    return f"{icon} {label}"
+
+
+def deployer_token_count(items: Optional[list[dict[str, Any]]], author: str) -> int:
+    """Count how many memepad tokens in `items` were deployed by `author`.
+
+    Used to flag serial-farmer / dump-pattern wallets in the alert.
+    """
+    if not author or not items:
+        return 0
+    a = author.strip().lower()
+    if not a:
+        return 0
+    n = 0
+    for item in items:
+        extra = item.get("memecoin_extra_details") if isinstance(item, dict) else None
+        if not isinstance(extra, dict):
+            continue
+        candidate = (extra.get("author") or "").strip().lower()
+        if candidate and candidate == a:
+            n += 1
+    return n
+
+
 def extract_social_links(
     *sources: Any,
     description_text: Any = None,
@@ -665,6 +760,67 @@ def pool_lt(pool: dict[str, Any]) -> int:
         return 0
 
 
+# STON.fi encodes native TON as a zero-padded jetton-master address.
+# https://docs.ston.fi/docs/developer-section/api-reference-v2 lists this as
+# the "pTON v1" address used in router pools.
+STONFI_NATIVE_TON_ADDR = "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"
+
+
+def normalize_stonfi_pool(raw: dict[str, Any]) -> dict[str, Any]:
+    """Convert a STON.fi /v1/pools entry into the DeDust-compatible internal
+    schema used by the rest of the tracker.
+
+    Returns an empty dict when the pool is deprecated or unparseable, so
+    callers can skip it cheaply.
+    """
+    if not isinstance(raw, dict) or raw.get("deprecated"):
+        return {}
+    addr = raw.get("address")
+    if not addr:
+        return {}
+    t0 = (raw.get("token0_address") or "").strip()
+    t1 = (raw.get("token1_address") or "").strip()
+    r0 = raw.get("reserve0", "0")
+    r1 = raw.get("reserve1", "0")
+
+    def _asset(addr_str: str) -> dict[str, Any]:
+        if not addr_str or addr_str == STONFI_NATIVE_TON_ADDR:
+            return {"type": "native"}
+        return {"type": "jetton", "address": addr_str, "metadata": {}}
+
+    # lp_fee + protocol_fee are basis points (1bp = 0.01%). Combine for total.
+    try:
+        lp = Decimal(str(raw.get("lp_fee") or 0))
+        proto = Decimal(str(raw.get("protocol_fee") or 0))
+        fee_pct: Optional[Decimal] = (lp + proto) / Decimal(100)
+    except (InvalidOperation, ValueError, TypeError):
+        fee_pct = None
+    fee_str = "?"
+    if fee_pct is not None:
+        s = f"{fee_pct:.2f}"
+        if s.endswith("0") and "." in s:
+            s = s.rstrip("0").rstrip(".")
+        fee_str = s
+
+    return {
+        "address": addr,
+        "type": "stonfi",
+        "_source": "stonfi",
+        "tradeFee": fee_str,
+        "lt": 0,
+        "assets": [_asset(t0), _asset(t1)],
+        "reserves": [str(r0), str(r1)],
+    }
+
+
+def pool_source(pool: dict[str, Any]) -> str:
+    """Return a stable label for the pool source ('dedust' / 'stonfi')."""
+    src = pool.get("_source")
+    if src:
+        return str(src)
+    return "stonfi" if pool.get("type") == "stonfi" else "dedust"
+
+
 def pool_ton_reserve(pool: dict[str, Any]) -> Decimal:
     """Return the native-TON side reserve of a pool, in TON (not nano)."""
     reserves = pool.get("reserves", [])
@@ -690,10 +846,30 @@ class Tracker:
         self._x1000_items_ts: float = 0.0
 
     def fetch_pools(self) -> list[dict[str, Any]]:
-        pools = self.http.get_json(self.cfg.dedust_pools_url)
-        if not isinstance(pools, list):
-            raise RuntimeError(f"Unexpected DeDust response: {type(pools)}")
-        pools = [p for p in pools if pick_jetton(p)]
+        pools: list[dict[str, Any]] = []
+
+        # DeDust source: failure here is fatal — primary feed.
+        dedust = self.http.get_json(self.cfg.dedust_pools_url)
+        if not isinstance(dedust, list):
+            raise RuntimeError(f"Unexpected DeDust response: {type(dedust)}")
+        for p in dedust:
+            if pick_jetton(p):
+                p.setdefault("_source", "dedust")
+                pools.append(p)
+
+        # STON.fi source: best-effort, never blocks DeDust alerts.
+        if self.cfg.stonfi_enabled:
+            try:
+                stonfi = self.http.get_json(self.cfg.stonfi_pools_url)
+            except Exception as e:
+                log.warning("STON.fi pools fetch failed: %s", e)
+                stonfi = None
+            if isinstance(stonfi, dict):
+                for raw in stonfi.get("pool_list", []) or []:
+                    np = normalize_stonfi_pool(raw)
+                    if np and pick_jetton(np):
+                        pools.append(np)
+
         if self.cfg.require_native_ton:
             pools = [p for p in pools if pool_has_ton(p)]
         if self.cfg.min_ton_reserves > 0:
@@ -768,6 +944,42 @@ class Tracker:
         items = self._fetch_x1000_items()
         return find_x1000_coin_details(jetton_addr, details, items)
 
+    def build_action_keyboard(
+        self,
+        *,
+        chart_url: str,
+        pool_addr: str,
+        jetton_addr: str,
+        source: str,
+    ) -> Optional[dict[str, Any]]:
+        """Construct a Telegram inline_keyboard for the alert action buttons.
+
+        Returns None when inline buttons are disabled in config so callers
+        fall back to the HTML link footer inside the message body.
+        """
+        if not self.cfg.inline_buttons:
+            return None
+        rows: list[list[dict[str, str]]] = []
+        if chart_url:
+            rows.append([{"text": "🟧 x1000 Chart", "url": chart_url}])
+        secondary: list[dict[str, str]] = []
+        if pool_addr:
+            if source == "stonfi":
+                secondary.append(
+                    {"text": "🔎 STON.fi", "url": f"https://app.ston.fi/pools/{pool_addr}"}
+                )
+            else:
+                secondary.append(
+                    {"text": "🔎 DeDust", "url": f"https://dedust.io/pools/{pool_addr}"}
+                )
+        if jetton_addr:
+            secondary.append(
+                {"text": "🧭 Tonviewer", "url": f"https://tonviewer.com/{jetton_addr}"}
+            )
+        if secondary:
+            rows.append(secondary)
+        return {"inline_keyboard": rows} if rows else None
+
     def build_x1000_link(self, jetton_addr: str, x1000_asset: Optional[str]) -> str:
         """Build a chart URL on x1000 terminal. Falls back to base URL if no
         token route pattern is configured (or formatting fails).
@@ -824,7 +1036,9 @@ class Tracker:
             parts.append(f"{human_amount(raw, md.get('decimals', 9))} {sym}")
         return " / ".join(parts) if parts else "-"
 
-    def build_message(self, pool: dict[str, Any]) -> tuple[str, Optional[str]]:
+    def build_message(
+        self, pool: dict[str, Any]
+    ) -> tuple[str, Optional[str], Optional[dict[str, Any]]]:
         jetton_asset = pick_jetton(pool) or {}
         jetton_addr = jetton_asset.get("address", "") or ""
         details = self.jetton_details(jetton_addr) if jetton_addr else {}
@@ -887,6 +1101,12 @@ class Tracker:
             if deployer_addr and not is_zero
             else None
         )
+        # How many other tokens did this wallet deploy in the cached x1000
+        # window? High number = serial farmer / dump pattern.
+        deployer_other_tokens = max(
+            0,
+            deployer_token_count(self._x1000_items or [], deployer_addr) - 1,
+        ) if deployer_addr and not is_zero else 0
 
         # Bonding curve
         bond = bonding_stats(x1000_extra)
@@ -951,10 +1171,19 @@ class Tracker:
                 if bond_collected is not None
                 else "Unknown"
             )
+            cluster_warn = (
+                " ⚠️"
+                if deployer_other_tokens >= int(self.cfg.dev_cluster_warn_threshold)
+                else ""
+            )
             lines.append(f"┣ Wallet: <code>{h(wallet_short)}</code>")
             lines.append(f"┣ Full: <code>{h(deployer_addr)}</code>")
             lines.append(f"┣ Balance: <code>{h(balance_str)}</code>")
             lines.append(f"┣ Deploy Amount: <code>{h(deploy_amount)}</code>")
+            if deployer_other_tokens > 0:
+                lines.append(
+                    f"┣ Other tokens 24h: <code>{deployer_other_tokens}{cluster_warn}</code>"
+                )
             lines.append("┗ Dev Buy: <code>Unknown</code>")
         else:
             lines.append("┗ <code>Revoked / zero address / unknown</code>")
@@ -986,6 +1215,12 @@ class Tracker:
             stats_rows.append(("Volume 24h", volume))
         if tx_24h:
             stats_rows.append(("Tx 24h", tx_24h))
+        tax_str = format_tax(x1000_coin)
+        if tax_str:
+            stats_rows.append(("Tax (buy/sell)", tax_str))
+        verif = format_verification(x1000_coin)
+        if verif:
+            stats_rows.append(("Status", verif))
 
         if not stats_rows:
             metadata_by_address = {jetton_addr: metadata} if jetton_addr else {}
@@ -1005,47 +1240,200 @@ class Tracker:
         lines.append("")
         lines.append(f"<code>{h(bar)}</code>")
 
-        # Action links
-        lines.append("")
-        lines.append(f'🟧 <a href="{h_attr(chart_url)}">Open x1000 Chart</a>')
-        if pool_addr:
-            lines.append(
-                f'🔎 <a href="https://dedust.io/pools/{h_attr(pool_addr)}">DeDust Pool</a>'
-            )
-        if jetton_addr:
-            lines.append(
-                f'🧭 <a href="https://tonviewer.com/{h_attr(jetton_addr)}">Tonviewer</a>'
-            )
+        # Action links — inline HTML <a> when inline_buttons disabled, else
+        # rendered as Telegram inline_keyboard (returned via reply_markup).
+        src = pool_source(pool)
+        reply_markup = self.build_action_keyboard(
+            chart_url=chart_url,
+            pool_addr=pool_addr,
+            jetton_addr=jetton_addr,
+            source=src,
+        )
+        if reply_markup is None:
+            lines.append("")
+            lines.append(f'🟧 <a href="{h_attr(chart_url)}">Open x1000 Chart</a>')
+            if pool_addr:
+                if src == "stonfi":
+                    lines.append(
+                        f'🔎 <a href="https://app.ston.fi/pools/{h_attr(pool_addr)}">STON.fi Pool</a>'
+                    )
+                else:
+                    lines.append(
+                        f'🔎 <a href="https://dedust.io/pools/{h_attr(pool_addr)}">DeDust Pool</a>'
+                    )
+            if jetton_addr:
+                lines.append(
+                    f'🧭 <a href="https://tonviewer.com/{h_attr(jetton_addr)}">Tonviewer</a>'
+                )
 
         # Disclaimer
         lines.append("")
         lines.append("⚠️ <b>Tracker Note</b>")
         lines.append("Automated alert, not financial advice. Always DYOR.")
 
-        return "\n".join(lines), image
+        return "\n".join(lines), image, reply_markup
 
     def send_launch(self, pool: dict[str, Any]) -> None:
-        text, image_url = self.build_message(pool)
-        payload = {
+        text, image_url, reply_markup = self.build_message(pool)
+        self._send_alert(text=text, image_url=image_url, reply_markup=reply_markup)
+
+    def _send_alert(
+        self,
+        *,
+        text: str,
+        image_url: Optional[str],
+        reply_markup: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Common send path for launch + graduation alerts.
+
+        Photo with caption when short enough; else photo + separate message.
+        Inline-keyboard reply_markup is attached to whichever call carries
+        the full text body (so buttons land on the message users actually
+        read, not on a photo header).
+        """
+        base_payload: dict[str, Any] = {
             "chat_id": self.cfg.telegram_chat_id,
             "parse_mode": "HTML",
             "disable_web_page_preview": "false",
         }
+        markup_str = json.dumps(reply_markup) if reply_markup else None
+        short = len(text) <= 1000
+
         if image_url:
-            photo_payload = dict(payload)
-            photo_payload["photo"] = image_url
-            # Telegram photo captions max 1024 chars. If message is longer, send
-            # the image first then send the full formatted alert as a message.
-            if len(text) <= 1000:
+            photo_payload = dict(base_payload, photo=image_url)
+            if short:
                 photo_payload["caption"] = text
+                if markup_str:
+                    photo_payload["reply_markup"] = markup_str
             try:
                 self.http.post_telegram("sendPhoto", photo_payload)
-                if len(text) <= 1000:
+                if short:
                     return
             except Exception as e:
                 log.warning("sendPhoto failed, fallback sendMessage: %s", e)
-        payload.update({"text": text})
-        self.http.post_telegram("sendMessage", payload)
+
+        msg_payload = dict(base_payload, text=text)
+        if markup_str:
+            msg_payload["reply_markup"] = markup_str
+        self.http.post_telegram("sendMessage", msg_payload)
+
+    # ---------------- Graduation alert ----------------
+
+    def build_graduation_message(
+        self, item: dict[str, Any]
+    ) -> tuple[str, Optional[str], Optional[dict[str, Any]]]:
+        """Build a separate alert for a memepad token whose bonding curve
+        crossed the configured graduation threshold.
+
+        Reuses the same x1000 enrichment shape as build_message but has its
+        own header / wording so users can distinguish it from a fresh launch.
+        """
+        meta = item.get("metadata") or {}
+        extra = item.get("memecoin_extra_details") or {}
+        symbol = meta.get("ticker") or meta.get("symbol") or "?"
+        name = meta.get("name") or symbol
+        jetton_addr = str(item.get("asset") or meta.get("address") or "")
+        image = meta.get("image_url") or None
+
+        bond = bonding_stats(extra)
+        bar = build_progress_bar(
+            bond.get("percent"),
+            length=int(self.cfg.progress_bar_length),
+        )
+        holders = item.get("holders")
+        market_cap = format_usd(item.get("market_cap"))
+        volume = coin_volume_24h(item)
+        chart_url = self.build_x1000_link(jetton_addr, jetton_addr)
+
+        lines: list[str] = []
+        lines.append(f"<b>🎓 ${h(symbol)} graduated on TON</b>")
+        lines.append("")
+        lines.append(f"<b>{h(name)}</b>")
+        if jetton_addr:
+            lines.append(f"<code>{h(jetton_addr)}</code>")
+
+        lines.append("")
+        lines.append("Bonding curve filled — token migrated to a real DEX pool.")
+
+        lines.append("")
+        lines.append("📊 <b>Final Stats</b>")
+        rows: list[tuple[str, str]] = []
+        if bond.get("collected") is not None and bond.get("max") is not None:
+            rows.append(
+                (
+                    "Raised",
+                    f"{format_ton_short(bond['collected'])} / "
+                    f"{format_ton_short(bond['max'])} TON",
+                )
+            )
+        if holders is not None:
+            rows.append(("Holders", str(holders)))
+        if market_cap:
+            rows.append(("Market Cap", market_cap))
+        if volume:
+            rows.append(("Volume 24h", volume))
+        for i, (k, v) in enumerate(rows or [("Status", "Graduated")]):
+            connector = "┗" if i == len(rows or [1]) - 1 else "┣"
+            lines.append(f"{connector} {h(k)}: <code>{h(v)}</code>")
+
+        lines.append("")
+        lines.append(f"<code>{h(bar)}</code>")
+
+        reply_markup = self.build_action_keyboard(
+            chart_url=chart_url,
+            pool_addr="",  # graduation has no pool; kept jetton + chart only
+            jetton_addr=jetton_addr,
+            source="dedust",
+        )
+        if reply_markup is None:
+            lines.append("")
+            lines.append(f'🟧 <a href="{h_attr(chart_url)}">Open x1000 Chart</a>')
+            if jetton_addr:
+                lines.append(
+                    f'🧭 <a href="https://tonviewer.com/{h_attr(jetton_addr)}">Tonviewer</a>'
+                )
+
+        lines.append("")
+        lines.append("⚠️ <b>Tracker Note</b>")
+        lines.append("Automated alert, not financial advice. Always DYOR.")
+
+        return "\n".join(lines), image, reply_markup
+
+    def send_graduation(self, item: dict[str, Any]) -> None:
+        text, image_url, reply_markup = self.build_graduation_message(item)
+        self._send_alert(text=text, image_url=image_url, reply_markup=reply_markup)
+
+    def _check_graduations(self) -> int:
+        """Fire one-shot graduation alerts for memepad assets that crossed
+        the configured threshold this tick.
+
+        Idempotent through `state.graduated` — each asset alerts at most
+        once for its lifetime.
+        """
+        if not self.cfg.x1000_enabled:
+            return 0
+        items = self._fetch_x1000_items()
+        if not items:
+            return 0
+        threshold = Decimal(self.cfg.graduation_threshold_pct)
+        sent = 0
+        for item in items:
+            asset_raw = str(item.get("asset") or "").strip().lower()
+            if not asset_raw or asset_raw in self.state.graduated:
+                continue
+            extra = item.get("memecoin_extra_details") or {}
+            pct = bonding_stats(extra).get("percent")
+            if pct is None or pct < threshold:
+                continue
+            try:
+                self.send_graduation(item)
+                sent += 1
+            except Exception as e:
+                log.exception("Failed sending graduation %s: %s", asset_raw, e)
+            finally:
+                self.state.graduated.add(asset_raw)
+                self.state.save()
+        return sent
 
     def tick(self) -> int:
         pools = self.fetch_pools()
@@ -1054,6 +1442,15 @@ class Tracker:
 
         if not self.state.seen and self.cfg.skip_existing_on_first_run:
             self.state.seen.update(p.get("address") for p in pools if p.get("address"))
+            # Baseline graduated set too, so first-run never spams a fresh
+            # install with already-graduated tokens.
+            for item in self._fetch_x1000_items() or []:
+                asset_raw = str(item.get("asset") or "").strip().lower()
+                if not asset_raw:
+                    continue
+                pct = bonding_stats(item.get("memecoin_extra_details") or {}).get("percent")
+                if pct is not None and pct >= Decimal(self.cfg.graduation_threshold_pct):
+                    self.state.graduated.add(asset_raw)
             self.state.save()
             log.info("First run: marked existing pools as seen without alerts")
             return 0
@@ -1071,6 +1468,8 @@ class Tracker:
             finally:
                 self.state.seen.add(addr)
                 self.state.save()
+        # Graduation alerts run even when no new pools showed up this tick.
+        sent += self._check_graduations()
         self.state.save()
         return sent
 
@@ -1100,9 +1499,11 @@ def main() -> None:
         if not sample:
             print("No pools returned by DeDust")
             return
-        text, image = tracker.build_message(sample)
+        text, image, reply_markup = tracker.build_message(sample)
         print("IMAGE:", image or "-")
         print(text)
+        if reply_markup:
+            print("KEYBOARD:", json.dumps(reply_markup, indent=2))
         return
 
     if args.once:

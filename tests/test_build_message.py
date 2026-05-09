@@ -67,9 +67,26 @@ COIN_FULL = {
 
 
 @pytest.fixture
-def tr():
+def tr(tmp_path):
+    """Default tracker fixture used by existing tests.
+
+    Inline buttons are disabled here so message-body assertions can keep
+    matching against HTML <a> link footers. Tests that exercise the
+    keyboard path opt in explicitly via `tr_buttons`.
+    """
     cfg = tracker.Config.from_env()
     cfg.skip_existing_on_first_run = False
+    cfg.inline_buttons = False
+    cfg.state_file = tmp_path / "state.json"
+    return tracker.Tracker(cfg)
+
+
+@pytest.fixture
+def tr_buttons(tmp_path):
+    cfg = tracker.Config.from_env()
+    cfg.skip_existing_on_first_run = False
+    cfg.inline_buttons = True
+    cfg.state_file = tmp_path / "state.json"
     return tracker.Tracker(cfg)
 
 
@@ -84,7 +101,7 @@ def patch(t, *, coin=None, balance="12.34", details=None):
 
 def test_ac1_message_has_all_sections(tr):
     patch(tr, coin=COIN_FULL)
-    text, image = tr.build_message(POOL)
+    text, image, _ = tr.build_message(POOL)
     for section in (
         "just launched on TON",
         "Description",
@@ -103,7 +120,7 @@ def test_ac1_message_has_all_sections(tr):
 
 def test_ac2_bonding_curve_renders_correctly(tr):
     patch(tr, coin=COIN_FULL)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert "4.85 / 1050 TON" in text
     assert "0.46%" in text
     assert "▰▱▱▱▱▱▱▱▱▱ 0.46%" in text
@@ -122,7 +139,7 @@ def test_ac3_socials_extracted_from_description(tr):
         "memecoin_extra_details": {"author": DEPLOYER},
     }
     patch(tr, coin=coin)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert '<a href="https://t.me/example">Telegram</a>' in text
     assert '<a href="https://x.com/example">X</a>' in text
 
@@ -131,7 +148,7 @@ def test_ac3_socials_extracted_from_description(tr):
 
 def test_ac4_fallback_when_x1000_unavailable(tr):
     patch(tr, coin=None)
-    text, image = tr.build_message(POOL)
+    text, image, _ = tr.build_message(POOL)
     # Still produces a valid alert
     assert "just launched on TON" in text
     assert "Shit on TON" in text
@@ -162,7 +179,7 @@ def test_ac5_html_in_token_metadata_is_escaped(tr):
         "admin": {"address": DEPLOYER},
     }
     patch(tr, coin=None, details=nasty)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     # Raw HTML must NOT survive into output
     assert "<script>alert(1)</script>" not in text
     assert "<img src=x onerror=alert(1)>" not in text
@@ -188,7 +205,7 @@ def test_regression_image_url_not_in_socials(tr):
         "memecoin_extra_details": {"author": DEPLOYER},
     }
     patch(tr, coin=coin)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert "https://cdn.dedust.io/image.webp" not in text
     assert "cdn.example/p.png" not in text
 
@@ -206,7 +223,7 @@ def test_regression_social_links_telegram_bare_host(tr):
         "memecoin_extra_details": {"author": DEPLOYER},
     }
     patch(tr, coin=coin)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert '<a href="https://t.me/Noblee33">Telegram</a>' in text
 
 
@@ -224,7 +241,7 @@ def test_regression_volume_nested_dict(tr):
         "transactions": {"buy": {"h24": 21}, "sell": {"h24": 14}},
     }
     patch(tr, coin=coin)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert "Volume 24h" in text
     assert "$12.53" in text
     assert "Tx 24h" in text
@@ -234,14 +251,14 @@ def test_regression_volume_nested_dict(tr):
 def test_chart_pattern_with_asset(tr):
     tr.cfg.x1000_token_route_pattern = "/coins/{asset}"
     patch(tr, coin=COIN_FULL)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert f"https://x1000.finance/coins/{JETTON.lower()}" in text
 
 
 def test_chart_pattern_absolute_url(tr):
     tr.cfg.x1000_token_route_pattern = "https://other.example/{asset}"
     patch(tr, coin=COIN_FULL)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert f"https://other.example/{JETTON.lower()}" in text
 
 
@@ -249,7 +266,7 @@ def test_chart_pattern_invalid_falls_back_to_base(tr):
     # Unknown placeholder triggers KeyError → fallback path
     tr.cfg.x1000_token_route_pattern = "/coins/{nonexistent}"
     patch(tr, coin=COIN_FULL)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert "https://x1000.finance/" in text
 
 
@@ -260,7 +277,7 @@ def test_zero_deployer(tr):
     zc["memecoin_extra_details"] = dict(zc["memecoin_extra_details"])
     zc["memecoin_extra_details"]["author"] = ZERO
     patch(tr, coin=zc, details=zd)
-    text, _ = tr.build_message(POOL)
+    text, _, _ = tr.build_message(POOL)
     assert "Revoked / zero address / unknown" in text
 
 

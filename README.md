@@ -151,10 +151,15 @@ All configuration is done through `.env`.
 | `X1000_API_URL` | `https://mainnet.api.dedust.io/v4/api/coins` | DeDust coins API endpoint. |
 | `X1000_BASE_URL` | `https://x1000.finance` | Fallback x1000 terminal link. |
 | `X1000_TOKEN_ROUTE_PATTERN` | empty | Optional token-specific x1000 route pattern. |
+| `STONFI_ENABLED` | `true` | Also fetch pools from STON.fi (second-largest TON DEX). |
+| `STONFI_POOLS_URL` | `https://api.ston.fi/v1/pools` | STON.fi pools endpoint. |
 | `PROGRESS_BAR_LENGTH` | `10` | Bonding progress bar length. |
 | `DESCRIPTION_MAX_CHARS` | `300` | Max description length in alerts. |
 | `MAX_SOCIAL_LINKS` | `5` | Max social links shown. |
 | `MIN_TON_RESERVES` | `0` | Minimum native-TON reserves (in TON) for a pool to qualify. `0` disables the filter. |
+| `GRADUATION_THRESHOLD_PCT` | `99` | Bonded % at which memepad tokens trigger a separate graduation alert. |
+| `DEV_CLUSTER_WARN_THRESHOLD` | `3` | Show ⚠️ on the Deployer block when wallet has launched ≥ N tokens in the cached x1000 list. `0` disables the icon. |
+| `INLINE_BUTTONS` | `true` | Use Telegram inline-keyboard buttons (Chart / DEX / Tonviewer) instead of HTML link footer. |
 | `TONAPI_CACHE_TTL_SECONDS` | `3600` | TTL for TonAPI jetton metadata cache. |
 | `BALANCE_CACHE_TTL_SECONDS` | `60` | TTL for TonAPI account balance cache. |
 | `X1000_CACHE_TTL_SECONDS` | `30` | TTL for x1000 coin list cache (shared by all pools in a tick). |
@@ -205,13 +210,26 @@ If you install the project outside `/root/ton-launch-tracker`, update `WorkingDi
 
 ## How detection works
 
-1. Bot polls DeDust pools.
+1. Bot polls DeDust **and** STON.fi pools.
 2. A pool is considered a launch candidate if it contains a jetton asset.
 3. By default, the pool must include native TON.
 4. Bot checks `state/seen_pools.json` to avoid duplicate alerts.
 5. On first run, existing pools are marked as seen if `SKIP_EXISTING_ON_FIRST_RUN=true`.
 6. For each new pool, bot enriches data from TonAPI and x1000/DeDust coins API.
-7. Bot sends a Telegram alert with image and formatted launch details.
+7. Bot sends a Telegram alert with image, formatted launch details, and inline action buttons.
+8. Each tick also scans the x1000 list for memepad tokens that crossed the bonding-curve graduation threshold and sends a one-shot graduation alert per asset.
+
+## Signal badges
+
+The Launch Stats block surfaces a few risk/quality signals when the source data exposes them:
+
+- **Tax (buy/sell)** from `buy_tax`/`sell_tax`. Displayed as `5% / 10%` with `✅` (zero), `⚠️` (≥10%), or `🚨` (≥25%).
+- **Status** from `verification_level`: `❓ Unverified`, `📋 Indexed`, `✅ Verified`, or `🛡️ Whitelisted`.
+- **Other tokens 24h** in the Deployer block: how many additional tokens this wallet deployed in the cached x1000 window — useful for spotting serial-farmer / dump-pattern wallets. Adds `⚠️` past `DEV_CLUSTER_WARN_THRESHOLD`.
+
+## Graduation alert
+
+When a memepad token's bonding curve hits `GRADUATION_THRESHOLD_PCT` (default 99%), the bot sends a separate alert with a `🎓` header and final stats (raised, holders, market cap, volume). Each asset graduates at most once thanks to `state/seen_pools.json`'s `graduated_assets` set.
 
 ## Safety and secrets
 
