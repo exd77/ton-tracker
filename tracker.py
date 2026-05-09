@@ -13,6 +13,9 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -42,6 +45,17 @@ class Config:
     progress_bar_length: int = 10
     description_max_chars: int = 300
     max_social_links: int = 5
+    # Min TON liquidity filter for pool to qualify as a launch (0 = disabled).
+    min_ton_reserves: Decimal = Decimal(0)
+    # In-memory cache TTLs (seconds). Jetton metadata is quasi-static;
+    # balance changes often but intra-tick reuse is still worthwhile;
+    # x1000 list is shared across all pools in a tick.
+    tonapi_cache_ttl: int = 3600
+    balance_cache_ttl: int = 60
+    x1000_cache_ttl: int = 30
+    # HTTP retry policy (429/5xx). total=0 disables retries.
+    http_retries: int = 3
+    http_backoff_factor: float = 1.0
     state_file: Path = Path("./state/seen_pools.json")
 
     @classmethod
@@ -70,8 +84,71 @@ class Config:
             progress_bar_length=int(os.getenv("PROGRESS_BAR_LENGTH", "10")),
             description_max_chars=int(os.getenv("DESCRIPTION_MAX_CHARS", "300")),
             max_social_links=int(os.getenv("MAX_SOCIAL_LINKS", "5")),
+            min_ton_reserves=_safe_decimal(os.getenv("MIN_TON_RESERVES", "0")),
+            tonapi_cache_ttl=int(os.getenv("TONAPI_CACHE_TTL_SECONDS", "3600")),
+            balance_cache_ttl=int(os.getenv("BALANCE_CACHE_TTL_SECONDS", "60")),
+            x1000_cache_ttl=int(os.getenv("X1000_CACHE_TTL_SECONDS", "30")),
+            http_retries=int(os.getenv("HTTP_RETRIES", "3")),
+            http_backoff_factor=float(os.getenv("HTTP_BACKOFF_FACTOR", "1.0")),
             state_file=Path(os.getenv("STATE_FILE", "./state/seen_pools.json")),
         )
+
+
+def _safe_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal(0)
+
+
+class TTLCache:
+    """Tiny in-process cache with per-entry TTL.
+
+    Designed for idempotent read-through caching of TonAPI and x1000
+    responses so that bursts of new-pool discoveries don't fan out into
+    duplicate network hits.
+    """
+
+    __slots__ = ("ttl", "_store")
+
+    def __init__(self, ttl_seconds: float):
+        self.ttl = float(ttl_seconds)
+        self._store: dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Any:
+        rec = self._store.get(key)
+        if not rec:
+            return None
+        ts, val = rec
+        if (time.time() - ts) > self.ttl:
+            self._store.pop(key, None)
+            return None
+        return val
+
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = (time.time(), value)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+def _build_retry(cfg: Config) -> Retry:
+    # Retry on 429 + common 5xx. Honor Retry-After if servers provide it.
+    kwargs: dict[str, Any] = {
+        "total": max(0, int(cfg.http_retries)),
+        "backoff_factor": float(cfg.http_backoff_factor),
+        "status_forcelist": (429, 500, 502, 503, 504),
+        "respect_retry_after_header": True,
+        "raise_on_status": False,
+    }
+    # urllib3 ≥1.26 uses allowed_methods; older versions used method_whitelist.
+    try:
+        return Retry(allowed_methods=frozenset(["GET", "POST"]), **kwargs)
+    except TypeError:
+        return Retry(method_whitelist=frozenset(["GET", "POST"]), **kwargs)
 
 
 class Http:
@@ -81,6 +158,9 @@ class Http:
         self.session.headers.update({"User-Agent": "ton-launch-tracker/1.0"})
         if cfg.tonapi_key:
             self.session.headers.update({"Authorization": f"Bearer {cfg.tonapi_key}"})
+        adapter = HTTPAdapter(max_retries=_build_retry(cfg))
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def get_json(
         self,
@@ -585,11 +665,29 @@ def pool_lt(pool: dict[str, Any]) -> int:
         return 0
 
 
+def pool_ton_reserve(pool: dict[str, Any]) -> Decimal:
+    """Return the native-TON side reserve of a pool, in TON (not nano)."""
+    reserves = pool.get("reserves", [])
+    for i, asset in enumerate(pool.get("assets", [])):
+        if is_native_ton(asset) and i < len(reserves):
+            try:
+                return Decimal(str(reserves[i])) / Decimal("1000000000")
+            except (InvalidOperation, ValueError, TypeError):
+                return Decimal(0)
+    return Decimal(0)
+
+
 class Tracker:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.http = Http(cfg)
         self.state = State(cfg.state_file)
+        self._jetton_cache = TTLCache(cfg.tonapi_cache_ttl)
+        self._balance_cache = TTLCache(cfg.balance_cache_ttl)
+        # x1000 is a full-list cache (not per-jetton): all pools in one tick
+        # reuse the same snapshot. Value is the `items` list.
+        self._x1000_items: Optional[list[dict[str, Any]]] = None
+        self._x1000_items_ts: float = 0.0
 
     def fetch_pools(self) -> list[dict[str, Any]]:
         pools = self.http.get_json(self.cfg.dedust_pools_url)
@@ -598,29 +696,44 @@ class Tracker:
         pools = [p for p in pools if pick_jetton(p)]
         if self.cfg.require_native_ton:
             pools = [p for p in pools if pool_has_ton(p)]
+        if self.cfg.min_ton_reserves > 0:
+            pools = [p for p in pools if pool_ton_reserve(p) >= self.cfg.min_ton_reserves]
         return sorted(pools, key=pool_lt)
 
     def tonapi(self, path: str) -> Any:
         return self.http.get_json(f"{self.cfg.tonapi_base_url}{path}")
 
     def jetton_details(self, address: str) -> dict[str, Any]:
+        if not address:
+            return {}
+        cached = self._jetton_cache.get(address)
+        if cached is not None:
+            return cached
         try:
-            return self.tonapi(f"/jettons/{address}")
+            data = self.tonapi(f"/jettons/{address}")
         except Exception as e:
             log.warning("TonAPI jetton lookup failed for %s: %s", address, e)
             return {}
+        # Only cache a non-empty successful response; transient {} would
+        # otherwise poison the cache for the full TTL.
+        if isinstance(data, dict) and data:
+            self._jetton_cache.set(address, data)
+        return data if isinstance(data, dict) else {}
 
-    def x1000_coin_for(self, jetton_addr: str, details: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Return the full DeDust/x1000 Memepad coin item for a jetton when available.
+    def _fetch_x1000_items(self) -> list[dict[str, Any]]:
+        """Return cached x1000/DeDust coins items, refreshing if stale.
 
-        x1000.finance/launches uses the public DeDust API endpoint
-        https://mainnet.api.dedust.io/v4/api/coins. With memecoin_extra_details=true,
-        DeDust memepad launches include memecoin_extra_details.author, curve_*,
-        plus richer metadata (image_url, description, holders, market_cap, ...).
-        Returning the whole item lets build_message reuse one network call.
+        On failure, keep the previous snapshot (best-effort) so a transient
+        outage doesn't erase enrichment mid-tick.
         """
-        if not self.cfg.x1000_enabled or not jetton_addr:
-            return None
+        if not self.cfg.x1000_enabled:
+            return []
+        now = time.time()
+        if (
+            self._x1000_items is not None
+            and (now - self._x1000_items_ts) < self.cfg.x1000_cache_ttl
+        ):
+            return self._x1000_items
         params = {
             "memecoin_extra_details": "true",
             "offset": 0,
@@ -637,9 +750,22 @@ class Tracker:
         try:
             data = self.http.get_json(self.cfg.x1000_api_url, params=params, headers=headers)
         except Exception as e:
-            log.warning("x1000/DeDust coins lookup failed for %s: %s", jetton_addr, e)
-            return None
+            log.warning("x1000/DeDust coins fetch failed: %s", e)
+            return self._x1000_items or []
         items = data.get("items", []) if isinstance(data, dict) else []
+        self._x1000_items = items
+        self._x1000_items_ts = now
+        return items
+
+    def x1000_coin_for(self, jetton_addr: str, details: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Return the full DeDust/x1000 Memepad coin item for a jetton when available.
+
+        Uses a single cached fetch of the top-100 memepad list per
+        X1000_CACHE_TTL_SECONDS so N pools in a tick share 1 HTTP call.
+        """
+        if not self.cfg.x1000_enabled or not jetton_addr:
+            return None
+        items = self._fetch_x1000_items()
         return find_x1000_coin_details(jetton_addr, details, items)
 
     def build_x1000_link(self, jetton_addr: str, x1000_asset: Optional[str]) -> str:
@@ -672,12 +798,17 @@ class Tracker:
     def account_balance_ton(self, address: str) -> Optional[str]:
         if not address or address.endswith(":" + "0" * 64):
             return None
+        cached = self._balance_cache.get(address)
+        if cached is not None:
+            return cached
         try:
             data = self.tonapi(f"/blockchain/accounts/{address}")
-            return ton_from_nano(data.get("balance"))
+            result = ton_from_nano(data.get("balance"))
         except Exception as e:
             log.warning("TonAPI account lookup failed for %s: %s", address, e)
             return None
+        self._balance_cache.set(address, result)
+        return result
 
     def pool_reserve_line(self, pool: dict[str, Any], metadata_by_address: Optional[dict[str, dict[str, Any]]] = None) -> str:
         metadata_by_address = metadata_by_address or {}

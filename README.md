@@ -153,6 +153,12 @@ All configuration is done through `.env`.
 | `PROGRESS_BAR_LENGTH` | `10` | Bonding progress bar length. |
 | `DESCRIPTION_MAX_CHARS` | `300` | Max description length in alerts. |
 | `MAX_SOCIAL_LINKS` | `5` | Max social links shown. |
+| `MIN_TON_RESERVES` | `0` | Minimum native-TON reserves (in TON) for a pool to qualify. `0` disables the filter. |
+| `TONAPI_CACHE_TTL_SECONDS` | `3600` | TTL for TonAPI jetton metadata cache. |
+| `BALANCE_CACHE_TTL_SECONDS` | `60` | TTL for TonAPI account balance cache. |
+| `X1000_CACHE_TTL_SECONDS` | `30` | TTL for x1000 coin list cache (shared by all pools in a tick). |
+| `HTTP_RETRIES` | `3` | Auto-retry count on 429/5xx responses (TonAPI, Telegram). `0` disables. |
+| `HTTP_BACKOFF_FACTOR` | `1.0` | Exponential backoff factor for retries. `1.0` → 1s, 2s, 4s. |
 | `STATE_FILE` | `./state/seen_pools.json` | Local seen-pool state path. |
 
 ## Optional x1000 chart route
@@ -261,6 +267,7 @@ X1000_API_URL=https://mainnet.api.dedust.io/v4/api/coins
 python -m py_compile tracker.py
 TELEGRAM_BOT_TOKEN='999999:TEST' TELEGRAM_CHAT_ID='0' python tracker.py --dry-run
 ```
+
 
 ## License
 
