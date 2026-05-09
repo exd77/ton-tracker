@@ -13,7 +13,6 @@ import pytest
 
 import tracker
 
-
 # ---------- nano <-> ton ----------
 
 def test_nano_to_ton_decimal_basic():
@@ -205,7 +204,7 @@ def test_extract_social_links_dedup_and_sort():
         {"website": "https://example.com"},
     )
     links = tracker.extract_social_links(*sources, max_count=10)
-    labels = [l.label for l in links]
+    labels = [link.label for link in links]
     # Telegram < X < Website by priority
     assert labels[0] == "Telegram"
     assert "X" in labels
@@ -222,7 +221,7 @@ def test_extract_social_links_walks_description_text():
     links = tracker.extract_social_links(
         {}, description_text="visit https://t.me/abc", max_count=10
     )
-    assert any(l.url == "https://t.me/abc" for l in links)
+    assert any(link.url == "https://t.me/abc" for link in links)
 
 
 # ---------- find_x1000_coin_details ----------

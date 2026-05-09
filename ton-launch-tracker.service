@@ -1,5 +1,5 @@
 [Unit]
-Description=TON DeDust New Launch Telegram Tracker
+Description=TON DeDust + STON.fi New Launch Telegram Tracker
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/ton-launch-tracker
 EnvironmentFile=/root/ton-launch-tracker/.env
-ExecStart=/root/ton-launch-tracker/.venv/bin/python /root/ton-launch-tracker/tracker.py
+ExecStart=/root/ton-launch-tracker/.venv/bin/python -m tracker
 Restart=always
 RestartSec=10
 

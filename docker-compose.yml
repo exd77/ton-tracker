@@ -1,0 +1,54 @@
+# Compose stack: the tracker bot plus a local Prometheus that scrapes its
+# /metrics endpoint. Drop a real .env in the repo root before bringing it up.
+#
+#   docker compose up -d --build
+#   docker compose logs -f tracker
+#
+# Prometheus UI lives on http://localhost:9090, the bot's healthcheck on
+# http://localhost:9100/healthz. Both are bound to 127.0.0.1 by default —
+# expose them publicly only behind your own reverse proxy.
+
+services:
+  tracker:
+    build: .
+    image: ton-launch-tracker:latest
+    container_name: ton-launch-tracker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override defaults so health/metrics are reachable on the network.
+      METRICS_PORT: "9100"
+    ports:
+      - "127.0.0.1:9100:9100"
+    volumes:
+      # Persist seen-pools / graduated-assets between container restarts.
+      - ./state:/data/state
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import urllib.request,sys; \
+              r=urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=3); \
+              sys.exit(0 if r.status==200 else 1)\""
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: ton-launch-tracker-prom
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - tracker
+
+volumes:
+  prom-data:

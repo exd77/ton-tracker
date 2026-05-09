@@ -118,19 +118,19 @@ If you send alerts to a Telegram channel, add the bot as a channel admin first.
 ### 4. Test without sending Telegram alerts
 
 ```bash
-python tracker.py --dry-run
+python -m tracker --dry-run
 ```
 
 ### 5. Run once
 
 ```bash
-python tracker.py --once
+python -m tracker --once
 ```
 
 ### 6. Run continuously
 
 ```bash
-python tracker.py
+python -m tracker
 ```
 
 ## Configuration
@@ -166,6 +166,7 @@ All configuration is done through `.env`.
 | `HTTP_RETRIES` | `3` | Auto-retry count on 429/5xx responses (TonAPI, Telegram). `0` disables. |
 | `HTTP_BACKOFF_FACTOR` | `1.0` | Exponential backoff factor for retries. `1.0` → 1s, 2s, 4s. |
 | `STATE_FILE` | `./state/seen_pools.json` | Local seen-pool state path. |
+| `METRICS_PORT` | `0` | Bind port for the Prometheus `/metrics` + `/healthz` HTTP server. `0` disables the server while leaving the in-process counters live. |
 
 ## Optional x1000 chart route
 
@@ -192,8 +193,40 @@ If the pattern cannot be formatted, the bot falls back to `X1000_BASE_URL`.
 
 ```bash
 docker build -t ton-new-token-tracker .
-docker run --env-file .env -v "$PWD/state:/app/state" ton-new-token-tracker
+docker run --env-file .env -v "$PWD/state:/data/state" ton-new-token-tracker
 ```
+
+## Docker Compose (with Prometheus)
+
+```bash
+cp .env.example .env  # fill in real values
+docker compose up -d --build
+docker compose logs -f tracker
+```
+
+This brings up the bot plus a Prometheus instance scraping the bot's
+`/metrics` endpoint on port `9100`. Defaults bind to `127.0.0.1` only:
+
+| Service | URL |
+| --- | --- |
+| Bot health | <http://localhost:9100/healthz> |
+| Bot metrics | <http://localhost:9100/metrics> |
+| Prometheus UI | <http://localhost:9090> |
+
+State is persisted under `./state/` (mounted into the container at
+`/data/state`) so seen pools and graduated assets survive restarts.
+
+### Exposed metrics
+
+| Metric | Type | Labels | Notes |
+| --- | --- | --- | --- |
+| `tracker_ticks_total` | counter | — | Number of polling ticks executed. |
+| `tracker_tick_errors_total` | counter | — | Ticks that raised before completing. |
+| `tracker_tick_duration_seconds` | histogram | — | Wall-clock duration of one tick. |
+| `tracker_pools_fetched` | gauge | — | Pool count returned by the latest fetch. |
+| `tracker_alerts_sent_total` | counter | `kind` (`launch`/`graduation`) | Successful Telegram sends. |
+| `tracker_alert_errors_total` | counter | `kind` | Telegram sends that raised after retries. |
+| `tracker_last_tick_unixtime` | gauge | — | Unix ts of the last successful tick. |
 
 ## systemd
 
@@ -283,18 +316,38 @@ X1000_API_URL=https://mainnet.api.dedust.io/v4/api/coins
 ## Development checks
 
 ```bash
-python -m py_compile tracker.py
-TELEGRAM_BOT_TOKEN='999999:TEST' TELEGRAM_CHAT_ID='0' python tracker.py --dry-run
+python -m compileall -q tracker
+TELEGRAM_BOT_TOKEN='999999:TEST' TELEGRAM_CHAT_ID='0' python -m tracker --dry-run
 ```
 
-## Tests
+## Tests / lint / type-check
 
 ```bash
-pip install pytest
+pip install pytest ruff mypy types-requests
+ruff check .
+mypy
 pytest tests/ -v
 ```
 
-CI runs `py_compile` + `pytest` on Python 3.11/3.12 for every push/PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+CI runs `ruff`, `mypy`, and `pytest` on Python 3.11/3.12 for every push/PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+## Project layout
+
+```
+tracker/
+├── __init__.py     # public re-exports (`import tracker`)
+├── __main__.py     # CLI entry point (`python -m tracker`)
+├── config.py       # Config dataclass loaded from .env
+├── http.py         # requests.Session with retry + TTLCache
+├── state.py        # seen-pools / graduated-assets persistence
+├── fmt.py          # pure formatting helpers
+├── social.py       # social-link extraction
+├── pool.py         # DeDust + STON.fi pool helpers
+├── enrichment.py   # x1000 coin signal badges (tax / verification / cluster)
+├── metrics.py      # Prometheus counters + /metrics + /healthz HTTP server
+└── bot.py          # Tracker orchestrator
+tests/              # pytest suite
+```
 
 ## License
 

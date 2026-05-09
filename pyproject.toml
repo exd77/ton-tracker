@@ -1,0 +1,45 @@
+[project]
+name = "ton-launch-tracker"
+version = "0.3.0"
+description = "Telegram bot that surfaces new TON token launches from DeDust and STON.fi."
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+    "tracker.py.bak",
+    "state",
+    ".venv",
+    "build",
+]
+
+[tool.ruff.lint]
+# A pragmatic baseline: pycodestyle errors+warnings, pyflakes, builtins,
+# import sorting, and bugbear. We deliberately skip ANN/D/PT/etc. which
+# would force broad annotation/docstring sweeps in this small project.
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = [
+    "E501",   # line length is enforced by formatter, not lint
+    "B008",   # function calls in argument defaults are common with Decimal
+    "UP007",  # keep Optional[X] for readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts in tests are fine
+
+[tool.mypy]
+python_version = "3.11"
+strict_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+# We don't enforce ``disallow_untyped_defs`` codebase-wide because the
+# tests use plenty of throwaway lambdas/fixtures; tracker/* itself is
+# typed and checked.
+files = ["tracker"]
+
+[[tool.mypy.overrides]]
+module = "tracker.*"
+disallow_incomplete_defs = true
+warn_unused_ignores = true
